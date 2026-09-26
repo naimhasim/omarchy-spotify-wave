@@ -18,6 +18,9 @@ prints one ASCII frame per line on stdout. The service starts `cava` against
 the config bundled at `config/cava` and parses those frames — nothing decodes
 audio inside the shell.
 
+> **One-time setup required.** Two manual steps: install `cava`, then run
+> `bin/spotify-wave-setup install` once. See [Install](#install).
+
 ## Demo
 
 ![Spotify Wave demo](previews/demo.gif)
@@ -51,7 +54,7 @@ use the bypass toggle (or set `preamp` down) rather than changing the default.
 
 - Omarchy 4 (Quattro) with the Quickshell shell (`omarchy-shell`).
 - PipeWire + WirePlumber with `filter-chain.service` (shipped by PipeWire; the
-  setup script enables it). No extra packages.
+  setup script enables it). `cava` is the one additional package, listed next.
 - Spotify playback through the `quickshell.spotify` plugin (librespot /
   `spotifyd`) or the official Spotify desktop client. With `source` set to
   `All output` the spectrum reacts to any system audio instead.
@@ -60,14 +63,26 @@ use the bypass toggle (or set `preamp` down) rather than changing the default.
 
 ## Install
 
-```
-omarchy plugin add https://github.com/naimhasim/omarchy-spotify-wave.git --enable
-~/.config/omarchy/plugins/naimhasim.spotify-wave/bin/spotify-wave-setup install
-```
+1. Install `cava`, the audio analyser:
 
-The shell never runs plugin code, so the second command — the one-time engine
-install — is required. It is safe to re-run after editing anything under
-`config/`.
+   ```
+   omarchy pkg add cava
+   ```
+
+2. Add and enable the plugin:
+
+   ```
+   omarchy plugin add https://github.com/naimhasim/omarchy-spotify-wave.git --enable
+   ```
+
+3. Install the engine fragments:
+
+   ```
+   ~/.config/omarchy/plugins/naimhasim.spotify-wave/bin/spotify-wave-setup install
+   ```
+
+The shell never runs plugin code, so step 3 — the one-time engine install — is
+required. It is safe to re-run after editing anything under `config/`.
 
 ## Remove
 
