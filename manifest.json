@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "naimhasim.spotify-wave",
+  "name": "Spotify Wave",
+  "version": "1.0.0",
+  "author": "naimhasim",
+  "license": "MIT",
+  "description": "10-band EQ + desktop music visualizer for Spotify: one filter-chain sink feeds both the equalizer and the cava spectrum strip",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Spotify Wave",
+    "description": "10-band equalizer and desktop spectrum visualizer for Spotify",
+    "category": "Media",
+    "aliases": ["eq", "equalizer", "visualizer", "spectrum", "spotify"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

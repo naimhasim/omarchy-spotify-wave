@@ -1,0 +1,11 @@
+# Editor / OS
+*~
+.*.swp
+.DS_Store
+
+# Quickshell build artifacts
+*.qmlc
+
+# Never commit local runtime state
+state.json
+settings.json

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# spotify-wave-setup -- install/uninstall the Spotify Wave audio engine.
+#
+# Installs the config fragments from this plugin's config/ directory into the
+# user's PipeWire, pipewire-pulse and WirePlumber config trees, enables the
+# filter-chain host, restarts the affected services and (re)applies the saved
+# state. There is a single `spotify_wave` sink: the 10-band EQ and the
+# visualizer's monitor share it, so no reconciliation with another plugin is
+# needed.
+#
+# Idempotent: safe to run install or uninstall repeatedly. Never restarts
+# pipewire.service; pipewire-pulse.service is only restarted when its fragment
+# actually changes (pulse.rules are read once at module load).
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$(dirname "$HERE")"
+HELPER="$HERE/spotify-wave"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+PW_SRC="$PLUGIN_DIR/config/pipewire/filter-chain.conf.d/60-spotify-wave.conf"
+PP_SRC="$PLUGIN_DIR/config/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf"
+WP_SRC="$PLUGIN_DIR/config/wireplumber/wireplumber.conf.d/60-spotify-wave.conf"
+PW_DST="$CONFIG_HOME/pipewire/filter-chain.conf.d/60-spotify-wave.conf"
+PP_DST="$CONFIG_HOME/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf"
+WP_DST="$CONFIG_HOME/wireplumber/wireplumber.conf.d/60-spotify-wave.conf"
+STATE_DIR="$STATE_HOME/spotify-wave"
+
+usage() {
+  cat <<'EOF'
+Usage: spotify-wave-setup <command>
+
+Commands:
+  install            Install the PipeWire, pipewire-pulse and WirePlumber config
+                     fragments, enable and restart filter-chain.service, restart
+                     wireplumber.service, seed the state file on first run and
+                     apply the saved state.
+  uninstall          Remove the installed config, restart the services and keep
+                     the state file.
+  uninstall --purge  Same, but also delete the state file directory.
+  -h, --help         Show this help.
+EOF
+}
+
+die() { printf 'spotify-wave-setup: %s\n' "$*" >&2; exit 1; }
+
+cmd_install() {
+  [ -f "$PW_SRC" ] || die "missing source config: $PW_SRC"
+  [ -f "$PP_SRC" ] || die "missing source config: $PP_SRC"
+  [ -f "$WP_SRC" ] || die "missing source config: $WP_SRC"
+
+  # pipewire-pulse must be restarted to pick up pulse.rules, so only do it when
+  # the fragment actually changes (keeps re-running install cheap).
+  local pulse_changed=0
+  cmp -s "$PP_SRC" "$PP_DST" 2>/dev/null || pulse_changed=1
+
+  mkdir -p "$(dirname "$PW_DST")" "$(dirname "$PP_DST")" "$(dirname "$WP_DST")"
+  install -m 0644 "$PW_SRC" "$PW_DST"
+  install -m 0644 "$PP_SRC" "$PP_DST"
+  install -m 0644 "$WP_SRC" "$WP_DST"
+
+  # filter-chain.service owns the spotify_wave sink; wireplumber applies the
+  # stream rules.
+  systemctl --user enable filter-chain.service >/dev/null 2>&1 || true
+  systemctl --user restart filter-chain.service >/dev/null 2>&1 \
+    || printf 'spotify-wave-setup: warning: could not restart filter-chain.service\n' >&2
+  systemctl --user restart wireplumber.service >/dev/null 2>&1 \
+    || printf 'spotify-wave-setup: warning: could not restart wireplumber.service\n' >&2
+  if [ "$pulse_changed" -eq 1 ]; then
+    systemctl --user restart pipewire-pulse.service >/dev/null 2>&1 \
+      || printf 'spotify-wave-setup: warning: could not restart pipewire-pulse.service\n' >&2
+  fi
+
+  # Seed state on first run (helper writes the default file if absent).
+  "$HELPER" status >/dev/null
+
+  # Point config/cava at the sink that is now live.
+  "$HELPER" ensure-source >/dev/null 2>&1 || true
+
+  # Push the saved state to the sink now that the node exists.
+  "$HELPER" apply
+
+  printf 'spotify-wave-setup: installed\n'
+  printf '  %s\n  %s\n  %s\n' "$PW_DST" "$PP_DST" "$WP_DST"
+  printf '  filter-chain.service enabled; filter-chain/wireplumber restarted'
+  if [ "$pulse_changed" -eq 1 ]; then
+    printf '; pipewire-pulse restarted'
+  fi
+  printf '\n'
+}
+
+cmd_uninstall() {
+  local purge=0
+  case "${1:-}" in
+    --purge) purge=1 ;;
+    '') ;;
+    *) die "uninstall: unknown option '${1}'" ;;
+  esac
+
+  local pulse_had_file=0
+  if [ -f "$PP_DST" ]; then
+    pulse_had_file=1
+  fi
+
+  rm -f "$PW_DST" "$PP_DST" "$WP_DST"
+
+  # Fully clean up the unit enabled by install (best effort; ignore errors).
+  systemctl --user disable filter-chain.service >/dev/null 2>&1 || true
+
+  systemctl --user restart filter-chain.service >/dev/null 2>&1 \
+    || printf 'spotify-wave-setup: warning: could not restart filter-chain.service\n' >&2
+  systemctl --user restart wireplumber.service >/dev/null 2>&1 \
+    || printf 'spotify-wave-setup: warning: could not restart wireplumber.service\n' >&2
+  if [ "$pulse_had_file" -eq 1 ]; then
+    systemctl --user restart pipewire-pulse.service >/dev/null 2>&1 \
+      || printf 'spotify-wave-setup: warning: could not restart pipewire-pulse.service\n' >&2
+  fi
+
+  if [ "$purge" -eq 1 ]; then
+    rm -rf "$STATE_DIR"
+    printf 'spotify-wave-setup: uninstalled (state purged)\n'
+  else
+    printf 'spotify-wave-setup: uninstalled (state kept at %s)\n' "$STATE_DIR"
+  fi
+}
+
+main() {
+  [ "$#" -gt 0 ] || { usage >&2; exit 1; }
+  local cmd=$1; shift
+  case "$cmd" in
+    install)            cmd_install "$@" ;;
+    uninstall)          cmd_uninstall "$@" ;;
+    -h|--help|help)     usage ;;
+    *) die "unknown command '$cmd' (try --help)" ;;
+  esac
+}
+
+main "$@"

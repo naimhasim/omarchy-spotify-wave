@@ -1,0 +1,973 @@
+#!/usr/bin/env bash
+#
+# spotify-wave -- combined EQ + visualizer helper for the naimhasim.spotify-wave
+# plugin.
+#
+# Single state file ${XDG_STATE_HOME:-$HOME/.local/state}/spotify-wave/state.json:
+#   {
+#     "eqEnabled": true, "preamp": 0, "preset": "Flat", "bands": [10 numbers],
+#     "vizEnabled": true, "style": "Dots", "source": "Spotify", "screen": "all",
+#     "sensitivity": 1.0, "bars": 64, "height": 320, "margin": 24, "dotSize": 6
+#   }
+#
+# The QML panel/service shell out to exactly this CLI:
+#   EQ side:   find-node | set <i> <gain> ... | preamp <dB> | preset <name> |
+#              reset | eq-enable | eq-disable | apply
+#   Viz side:  status | set <key> <value> | toggle | ensure-source |
+#              verify-source | cava-config-path | selftest | --help
+#
+# `set` dispatches on its first argument: an all-numeric argument list means EQ
+# band gains, a word means a visualizer setting.
+#
+# The EQ sink is defined in config/pipewire/filter-chain.conf.d/60-spotify-wave.conf
+# and only present after filter-chain.service is running. Routing the Spotify
+# stream into it is done by the pipewire-pulse fragment; this script only moves
+# control values, so every apply tolerates a missing sink.
+#
+# Environment overrides (used by selftest):
+#   SPOTIFY_WAVE_STATE_DIR       state directory
+#   SPOTIFY_WAVE_CAVA_CONFIG     cava config path
+#   SPOTIFY_WAVE_EXPECT_SOURCE   override the expected cava source (verify-source)
+#   SPOTIFY_WAVE_SINKS           whitespace list of sinks, instead of `pactl`
+#   SPOTIFY_WAVE_SOURCES         whitespace list of sources, instead of `pactl`
+#   SPOTIFY_WAVE_NODE            node.name to look for (default: spotify_wave)
+#   SPOTIFY_WAVE_EQ_STATE        old EQ state file used for first-run migration
+#   SPOTIFY_WAVE_VIS_STATE       old visualizer settings file used for migration
+
+set -euo pipefail
+
+STATE_DIR="${SPOTIFY_WAVE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/spotify-wave}"
+STATE_FILE="$STATE_DIR/state.json"
+NODE="${SPOTIFY_WAVE_NODE:-spotify_wave}"
+SELF="${BASH_SOURCE[0]}"
+# Absolutise so config/cava resolution (and verify-source's pgrep anchor) does
+# not depend on the caller's working directory.
+if [[ $SELF != /* ]]; then
+  SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
+fi
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+EQ_STATE="${SPOTIFY_WAVE_EQ_STATE:-$STATE_HOME/spotify-eq/state.json}"
+VIS_STATE="${SPOTIFY_WAVE_VIS_STATE:-$STATE_HOME/spotify-visualizer/settings.json}"
+
+DEFAULTS='{"eqEnabled":true,"preamp":0,"preset":"Flat","bands":[0,0,0,0,0,0,0,0,0,0],"vizEnabled":true,"style":"Dots","source":"Spotify","screen":"all","sensitivity":1.0,"bars":64,"height":320,"margin":24,"dotSize":6}'
+
+usage() {
+  cat <<'EOF'
+Usage: spotify-wave <command> [args]
+
+Equalizer:
+  find-node                     Print the spotify_wave node id, or exit 1 if absent.
+  set <i> <gain> [<i> <gain> ...]
+                                Set band(s) by 0-based index (0..9). Gain is
+                                clamped to [-12, 12]. Applies only these bands.
+  preamp <dB>                   Set preamp in dB, clamped to [-12, 12].
+  preset <name>                 Load a preset and apply it.
+  reset                         Flat: all gains 0, preamp 0 dB.
+  eq-enable                     Reapply the stored state.
+  eq-disable                    Apply flat but keep the stored state.
+  apply                         Apply the full current state.
+
+Visualizer:
+  status                        Print the settings JSON, plus effectiveSource.
+  set <key> <value>             Set one visualizer setting. Keys:
+                                  vizEnabled   true|false
+                                  style        Dots|Particles|Bars|Mirrored|Wave|Peaks|Aurora
+                                  sensitivity  number, clamped to [0.25, 3.0]
+                                  bars         number, clamped to [16, 64]
+                                  height       number, clamped to [40, 400]
+                                  margin       number, clamped to [0, 200]
+                                  dotSize      number, clamped to [2, 24]
+                                  screen       "all" or a monitor name
+                                  source       Spotify|"All output" (aliases: all, output)
+  toggle                        Flip vizEnabled.
+  cava-config-path              Print the resolved config/cava path.
+  ensure-source                 Resolve the configured source and rewrite
+                                config/cava if it differs. Prints "changed" or
+                                "same".
+  verify-source                 Check the running cava captures the configured
+                                source. Exit 0 match, 1 mismatch, 2 unknown.
+
+  selftest                      Run headless argument/state checks.
+  -h, --help                    Show this help.
+
+Presets: Flat, Bass Boost, Treble Boost, Vocal, Loudness, Rock
+EOF
+}
+
+die() { printf 'spotify-wave: %s\n' "$*" >&2; exit 1; }
+
+is_num() { # <value>: integer or decimal, optional sign
+  [[ $1 =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+clamp() { # <value> <min> <max> -> number
+  awk -v v="$1" -v lo="$2" -v hi="$3" \
+    'BEGIN { if (v < lo) v = lo; if (v > hi) v = hi; printf "%g", v }'
+}
+
+clamp_int() { # <value> <min> <max> -> integer
+  awk -v v="$1" -v lo="$2" -v hi="$3" \
+    'BEGIN { v = int(v + 0.5); if (v < lo) v = lo; if (v > hi) v = hi; printf "%d", v }'
+}
+
+db_to_mult() { # <dB> -> linear multiplier, 6 decimals
+  awk -v v="$1" 'BEGIN { printf "%.6f", exp(log(10) * v / 20) }'
+}
+
+style_canon() { # <value> -> canonical style, or non-zero
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    dots)      printf 'Dots\n' ;;
+    particles) printf 'Particles\n' ;;
+    bars)      printf 'Bars\n' ;;
+    mirrored)  printf 'Mirrored\n' ;;
+    wave)      printf 'Wave\n' ;;
+    peaks)     printf 'Peaks\n' ;;
+    aurora)    printf 'Aurora\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+source_canon() { # <value> -> canonical source, or non-zero
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    spotify)                printf 'Spotify\n' ;;
+    all|output|all\ output) printf 'All output\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---- state -------------------------------------------------------------------
+
+available_sinks() {
+  if [ -n "${SPOTIFY_WAVE_SINKS+x}" ]; then
+    printf '%s\n' "$SPOTIFY_WAVE_SINKS" | tr ' ' '\n'
+    return 0
+  fi
+  command -v pactl >/dev/null 2>&1 || return 0
+  pactl list short sinks 2>/dev/null | awk '{print $2}'
+}
+
+sink_present() { available_sinks | grep -qx "$1"; }
+
+available_sources() {
+  if [ -n "${SPOTIFY_WAVE_SOURCES+x}" ]; then
+    printf '%s\n' "$SPOTIFY_WAVE_SOURCES" | tr ' ' '\n'
+    return 0
+  fi
+  command -v pactl >/dev/null 2>&1 || return 0
+  pactl list short sources 2>/dev/null | awk '{print $2}'
+}
+
+source_present() { available_sources | grep -qx "$1"; }
+
+# Canonical state value -> cava `[input] source`. There is a single Spotify sink
+# now (`spotify_wave`), so Spotify always resolves to its monitor; "All output"
+# uses `auto`, cava's currently selected output monitor.
+resolve_source() { # <canonical source> -> cava source, non-zero if unknown
+  case "$1" in
+    Spotify)      printf 'spotify_wave.monitor\n' ;;
+    'All output') printf 'auto\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_state() {
+  [ -f "$STATE_FILE" ] || return 1
+  jq -e '
+       type == "object"
+       and (.eqEnabled | type == "boolean")
+       and (.vizEnabled | type == "boolean")
+       and (.preamp | type == "number")
+       and (.preset | type == "string")
+       and (.bands | type == "array" and length == 10)
+       and (.style | IN("Dots","Particles","Bars","Mirrored","Wave","Peaks","Aurora"))
+       and (.sensitivity | type == "number")
+       and (.bars | type == "number")
+       and (.height | type == "number")
+       and (.margin | type == "number")
+       and (.dotSize | type == "number")
+       and (.screen | type == "string")
+       and (.source | IN("Spotify","All output"))
+     ' "$STATE_FILE" >/dev/null 2>&1
+}
+
+# First run only: seed from the old spotify-eq / spotify-visualizer state files.
+# Never deletes them; only reads what is present.
+migrate_state() {
+  local eq vis
+  eq=$(cat "$EQ_STATE" 2>/dev/null || printf '{}')
+  vis=$(cat "$VIS_STATE" 2>/dev/null || printf '{}')
+  jq -n --argjson d "$DEFAULTS" --arg eq "$eq" --arg vis "$vis" '
+    ($d) as $b
+    | (($eq | try fromjson catch {}) // {}) as $e
+    | (($vis | try fromjson catch {}) // {}) as $v
+    | $b
+    | .eqEnabled = (if ($e.enabled | type) == "boolean" then $e.enabled else $b.eqEnabled end)
+    | .preamp    = (if ($e.preamp  | type) == "number"  then $e.preamp  else $b.preamp  end)
+    | .preset    = (if ($e.preset  | type) == "string"  then $e.preset  else $b.preset  end)
+    | .bands     = (if (($e.bands | type) == "array" and ($e.bands | length) == 10)
+                     then $e.bands else $b.bands end)
+    | .vizEnabled = (if ($v.enabled | type) == "boolean" then $v.enabled else $b.vizEnabled end)
+    | .style     = (if (($v.style // "") | IN("Dots","Particles","Bars","Mirrored","Wave","Peaks","Aurora"))
+                     then $v.style else $b.style end)
+    | .source    = (if $v.source == "All output" then "All output" else "Spotify" end)
+    | .screen    = (if (($v.screen | type) == "string" and $v.screen != "")
+                     then $v.screen else $b.screen end)
+    | .sensitivity = (if ($v.sensitivity | type) == "number" then $v.sensitivity else $b.sensitivity end)
+    | .bars      = (if ($v.bars | type) == "number" then $v.bars else $b.bars end)
+    | .height    = (if ($v.height | type) == "number" then $v.height else $b.height end)
+    | .margin    = (if ($v.margin | type) == "number" then $v.margin else $b.margin end)
+    | .dotSize   = (if ($v.dotSize | type) == "number" then $v.dotSize else $b.dotSize end)
+  ' > "$STATE_FILE"
+}
+
+ensure_state() {
+  [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR"
+  if [ -f "$STATE_FILE" ]; then
+    if valid_state; then
+      # Valid state, possibly written before `source` existed: add just that
+      # key (or fix a bad value) without touching the user's other settings.
+      if ! jq -e '.source | IN("Spotify","All output")' "$STATE_FILE" >/dev/null 2>&1; then
+        local tmp
+        tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+        if jq '.source = "Spotify"' "$STATE_FILE" > "$tmp" 2>/dev/null; then
+          mv "$tmp" "$STATE_FILE"
+        else
+          rm -f "$tmp"
+        fi
+      fi
+      return 0
+    fi
+    # Corrupt/unreadable existing state: self-heal to defaults. Do NOT migrate
+    # again (the old files may be stale by now).
+    printf '%s\n' "$DEFAULTS" > "$STATE_FILE"
+    return 0
+  fi
+  migrate_state
+}
+
+# State writes are serialized with flock so concurrent `set`/`reset` calls
+# cannot interleave. The same lock also guards config/cava rewrites (set_bars,
+# set_source), keeping state.json and the cava values in lockstep.
+with_state_lock() { # <cmd...>: run under the state lock (fd 9 held)
+  ( flock -x 9; "$@" ) 9>"$STATE_DIR/.lock"
+}
+
+_update_state_locked() { # <tmp> <jq-filter> [jq args...]
+  local tmp=$1 filter=$2; shift 2
+  jq "$@" "$filter" "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$STATE_FILE"
+}
+
+update_state() { # <jq-filter> [jq args...]
+  ensure_state
+  local filter=$1; shift
+  local tmp
+  tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+  with_state_lock _update_state_locked "$tmp" "$filter" "$@"
+}
+
+# ---- cava config sync --------------------------------------------------------
+#
+# Service.qml sizes its rendering and its frame-length filter from the `bars`
+# value in config/cava, and restarts cava when the `bars` or `source` setting
+# changes. Keep state and config/cava in lockstep: `set bars`, `set source`,
+# `reset` and `ensure-source` rewrite config/cava under the state lock.
+
+cava_config_path() {
+  printf '%s\n' "${SPOTIFY_WAVE_CAVA_CONFIG:-$(dirname "$(dirname "$SELF")")/config/cava}"
+}
+
+write_cava_bars() { # <N>: rewrite the `bars =` line; atomic, byte-preserving
+  local n=$1 cfg tmp
+  cfg=$(cava_config_path)
+  [ -e "$cfg" ] || return 0            # absent config: settings-only, do not fail
+  [[ $n =~ ^[0-9]+$ ]] || die "internal: non-numeric bars '$n'"
+  [ "$n" -ge 16 ] && [ "$n" -le 64 ] || die "internal: bars out of range '$n'"
+
+  tmp=$(mktemp "${cfg}.XXXXXX")
+  if grep -qE '^bars[[:space:]]*=' "$cfg"; then
+    sed -E "s/^bars[[:space:]]*=.*/bars = $n/" "$cfg" > "$tmp"
+  else
+    awk -v n="$n" '
+      { print }
+      !done && $0 ~ /^\[general\][[:space:]]*$/ { print "bars = " n; done=1 }
+      END { if (!done) print "bars = " n }
+    ' "$cfg" > "$tmp"
+  fi
+  chmod --reference="$cfg" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$cfg"
+}
+
+_set_bars_locked() { # <tmp> <N>: state.json + config/cava in one critical section
+  local tmp=$1 n=$2
+  jq --argjson n "$n" '.bars = $n' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$STATE_FILE"
+  write_cava_bars "$n"
+}
+
+set_bars() { # <N>
+  ensure_state
+  local tmp
+  tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+  with_state_lock _set_bars_locked "$tmp" "$1"
+}
+
+write_cava_source() { # <resolved-cava-source>: rewrite `source =`; atomic, byte-preserving
+  local src=$1 cfg tmp
+  cfg=$(cava_config_path)
+  [ -e "$cfg" ] || return 0            # absent config: settings-only, do not fail
+  case "$src" in
+    spotify_wave.monitor|auto) ;;      # known values; no injection risk
+    *) die "internal: bad cava source '$src'" ;;
+  esac
+
+  tmp=$(mktemp "${cfg}.XXXXXX")
+  if grep -qE '^source[[:space:]]*=' "$cfg"; then
+    sed -E "s/^source[[:space:]]*=.*/source = $src/" "$cfg" > "$tmp"
+  else
+    awk -v s="$src" '
+      { print }
+      !done && $0 ~ /^\[input\][[:space:]]*$/ { print "source = " s; done=1 }
+      END { if (!done) print "source = " s }
+    ' "$cfg" > "$tmp"
+  fi
+  chmod --reference="$cfg" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$cfg"
+}
+
+_set_source_locked() { # <tmp> <canonical>: state.json + config/cava, one lock
+  local tmp=$1 val=$2
+  jq --arg v "$val" '.source = $v' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$STATE_FILE"
+  # Store the *resolved* monitor: config/cava is what cava actually reads.
+  write_cava_source "$(resolve_source "$val")"
+}
+
+set_source() { # <canonical>
+  ensure_state
+  local tmp
+  tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+  with_state_lock _set_source_locked "$tmp" "$1"
+}
+
+# Current `source =` value in config/cava, or empty when absent.
+cava_source_value() {
+  local cfg
+  cfg=$(cava_config_path)
+  [ -e "$cfg" ] || return 0
+  sed -nE 's/^source[[:space:]]*=[[:space:]]*([^[:space:]#]+).*/\1/p' "$cfg" | head -n1
+}
+
+# Reconcile config/cava with the resolved Spotify sink without changing state.
+_ensure_source_locked() { # <lock-token> <want>
+  local token=$1 want=$2 have
+  rm -f "$token"   # token exists only to create the lock fd file; not a state write
+  have=$(cava_source_value)
+  if [ "$have" = "$want" ]; then
+    printf 'same\n'
+    return 0
+  fi
+  write_cava_source "$want"
+  printf 'changed\n'
+}
+
+cmd_ensure_source() {
+  ensure_state
+  local canon want tmp
+  canon=$(jq -r '.source // "Spotify"' "$STATE_FILE" 2>/dev/null) || canon="Spotify"
+  case "$canon" in
+    Spotify|'All output') ;;
+    *) canon="Spotify" ;;
+  esac
+  want=$(resolve_source "$canon") || return 1
+  tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+  with_state_lock _ensure_source_locked "$tmp" "$want"
+}
+
+# ---- verify-source -----------------------------------------------------------
+#
+# cava 0.10.7 + method=pipewire can silently capture the default sink monitor
+# even when config/cava names a different `source` (Pulse module-stream-restore
+# latches the stream-output). verify-source detects that so Service.qml can
+# self-heal by restarting cava. Exit codes: 0 match, 1 mismatch, 2 unknown.
+
+# PID of the cava running this plugin's config. Anchored so a shell whose
+# command line merely mentions the path is not matched.
+cava_pid() {
+  local cfg esc
+  cfg=$(cava_config_path)
+  esc=$(printf '%s' "$cfg" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+  pgrep -f "^cava -p ${esc}$" 2>/dev/null | head -n1
+}
+
+# Resolve a source-output `Source:` value to a node name. PipeWire's pactl can
+# report a numeric object id instead of a name; map it via the short listing.
+resolve_source_name() { # <source field> -> name
+  local s=$1 name
+  [ -n "$s" ] || return 1
+  if [[ $s =~ ^[0-9]+$ ]]; then
+    name=$(pactl list short sources 2>/dev/null | awk -v i="$s" '$1==i {print $2; exit}')
+    [ -n "$name" ] || name=$(pactl list short sinks 2>/dev/null | awk -v i="$s" '$1==i {print $2; exit}')
+    [ -n "$name" ] || return 1
+    printf '%s\n' "$name"
+  else
+    printf '%s\n' "$s"
+  fi
+}
+
+# Which node the given cava PID's capture stream is connected to. Anchors on
+# application.process.id when present, falling back to cava's node/media name.
+observe_cava_source() { # <pid> -> source field
+  local pid=$1 out
+  out=$(pactl list source-outputs 2>/dev/null | awk -v pid="$pid" '
+    BEGIN { RS=""; FS="\n" }
+    {
+      src=""; apppid=""; is_cava=0
+      for (i=1; i<=NF; i++) {
+        line=$i
+        if (line ~ /^[[:space:]]*Source:[[:space:]]*/) {
+          src=line; sub(/^[[:space:]]*Source:[[:space:]]*/,"",src)
+        } else if (line ~ /^[[:space:]]*application\.process\.id[[:space:]]*=/) {
+          apppid=line; sub(/^[^=]*=[[:space:]]*/,"",apppid); gsub(/"/,"",apppid)
+        } else if (line ~ /^[[:space:]]*(node\.name|media\.name)[[:space:]]*=/) {
+          v=line; sub(/^[^=]*=[[:space:]]*/,"",v); gsub(/"/,"",v)
+          if (v=="cava") is_cava=1
+        }
+      }
+      if (src=="") next
+      if (apppid!="") { if (apppid==pid) { print src; exit } }
+      else if (is_cava) { print src; exit }
+    }
+  ') || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Source the running cava should be on for the current setting. Returns 1 for an
+# unknown setting and 2 when the resolved monitor is not currently present, so
+# an absent sink never reports a mismatch and triggers a heal loop.
+expected_source() {
+  local src dflt resolved
+  src=$(jq -r '.source // "Spotify"' "$STATE_FILE" 2>/dev/null) || return 1
+  case "$src" in
+    Spotify)
+      resolved=$(resolve_source Spotify) || return 1
+      source_present "$resolved" || return 2
+      printf '%s\n' "$resolved" ;;
+    'All output')
+      dflt=$(pactl get-default-sink 2>/dev/null) || dflt=""
+      if [ -n "$dflt" ]; then printf '%s.monitor\n' "$dflt"
+      else printf '*.monitor\n'; fi ;;   # unresolved default: accept any monitor
+    *) return 1 ;;
+  esac
+}
+
+verify_source() { # -> 0 match, 1 mismatch, 2 unknown
+  command -v pactl >/dev/null 2>&1 || return 2
+  local pid observed expected
+  # Resolve the expectation first: if the resolved monitor is not present at
+  # all, the answer is "unknown" (2), never a mismatch.
+  if [ -n "${SPOTIFY_WAVE_EXPECT_SOURCE:-}" ]; then
+    expected=$SPOTIFY_WAVE_EXPECT_SOURCE
+  else
+    expected=$(expected_source) || return 2
+  fi
+  pid=$(cava_pid) || true
+  [ -n "${pid:-}" ] || return 2
+  observed=$(observe_cava_source "$pid") || return 2
+  observed=$(resolve_source_name "$observed") || return 2
+  if [ "$expected" = '*.monitor' ]; then
+    case "$observed" in *.monitor) return 0 ;; *) return 1 ;; esac
+  fi
+  [ "$observed" = "$expected" ] && return 0
+  return 1
+}
+
+cmd_verify_source() {
+  local rc=0
+  verify_source || rc=$?
+  case "$rc" in
+    0) printf 'ok: cava source matches the configured source\n' ;;
+    1) printf 'mismatch: cava source is not the configured source\n' >&2; exit 1 ;;
+    *) printf 'unknown: cannot determine cava source\n' >&2; exit 2 ;;
+  esac
+}
+
+# ---- EQ engine ---------------------------------------------------------------
+
+find_node() {
+  command -v pw-dump >/dev/null 2>&1 || return 1
+  local id
+  id=$(pw-dump 2>/dev/null | jq -r --arg n "$NODE" \
+        'first(.[] | select(.info.props["node.name"] == $n) | .id) // empty' 2>/dev/null) || true
+  case "$id" in
+    ''|null|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$id"
+}
+
+build_pod() { # <name> <value> [<name> <value> ...]
+  local pod='{ params = [' name val
+  while [ "$#" -gt 0 ]; do
+    name=$1
+    val=$2
+    shift 2
+    pod="$pod \"$name\" $(printf '%.6f' "$val")"
+  done
+  printf '%s ] }' "$pod"
+}
+
+apply_pairs() { # <name> <value> ...
+  local id
+  if ! id=$(find_node); then
+    return 0  # sink not up yet; state is already saved and apply re-runs later
+  fi
+  [ "$#" -gt 0 ] || return 0
+  pw-cli set-param "$id" Props "$(build_pod "$@")" >/dev/null 2>&1 || true
+}
+
+apply_state() {
+  ensure_state
+  local enabled i v
+  local pairs=()
+  enabled=$(jq -r '.eqEnabled' "$STATE_FILE")
+  if [ "$enabled" = "true" ]; then
+    for i in 0 1 2 3 4 5 6 7 8 9; do
+      v=$(jq -r ".bands[$i]" "$STATE_FILE")
+      pairs+=("band_$((i + 1)):Gain" "$v")
+    done
+    v=$(jq -r '.preamp' "$STATE_FILE")
+    pairs+=("preamp:Mult" "$(db_to_mult "$v")")
+  else
+    for i in 0 1 2 3 4 5 6 7 8 9; do
+      pairs+=("band_$((i + 1)):Gain" 0)
+    done
+    pairs+=("preamp:Mult" 1)
+  fi
+  apply_pairs "${pairs[@]}"
+}
+
+cmd_set_bands() {
+  [ "$#" -ge 2 ] || die "set: need <index> <gain> [<index> <gain> ...]"
+  [ $(( $# % 2 )) -eq 0 ] || die "set: odd number of arguments"
+  ensure_state
+  local json='. | .preset = "Custom"' i g
+  local pairs=()
+  while [ "$#" -gt 0 ]; do
+    i=$1
+    g=$2
+    shift 2
+    case "$i" in
+      ''|*[!0-9]*) die "set: invalid index '$i'" ;;
+    esac
+    [ "$i" -le 9 ] || die "set: index $i out of range 0..9"
+    is_num "$g" || die "set: invalid gain '$g'"
+    g=$(clamp "$g" -12 12)
+    json="$json | .bands[$i] = $g"
+    pairs+=("band_$((i + 1)):Gain" "$g")
+  done
+  update_state "$json"
+  if [ "$(jq -r '.eqEnabled' "$STATE_FILE")" = "true" ]; then
+    apply_pairs "${pairs[@]}"
+  fi
+}
+
+cmd_preamp() {
+  [ "$#" -eq 1 ] || die "preamp: need <value>"
+  is_num "$1" || die "preamp: invalid value '$1'"
+  ensure_state
+  local v
+  v=$(clamp "$1" -12 12)
+  update_state ".preamp = $v"
+  if [ "$(jq -r '.eqEnabled' "$STATE_FILE")" = "true" ]; then
+    apply_pairs "preamp:Mult" "$(db_to_mult "$v")"
+  fi
+}
+
+cmd_preset() {
+  [ "$#" -eq 1 ] || die "preset: need <name>"
+  ensure_state
+  local name disp bands preamp
+  name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr ' _' '--')
+  case "$name" in
+    flat)                disp="Flat";          bands=(0 0 0 0 0 0 0 0 0 0);       preamp=0 ;;
+    bass-boost|bass)     disp="Bass Boost";    bands=(6 5 4 2 0 0 0 0 0 0);     preamp=-1 ;;
+    treble-boost|treble) disp="Treble Boost";  bands=(0 0 0 0 0 0 2 4 5 6); preamp=-1 ;;
+    vocal)               disp="Vocal";         bands=(-3 -2 -1 1 3 3 2 1 0 0);    preamp=0 ;;
+    loudness)            disp="Loudness";      bands=(6 5 2 0 -1 0 2 3 4 5);      preamp=-2 ;;
+    rock)                disp="Rock";          bands=(5 4 2 0 -1 0 1 3 4 4);      preamp=-1 ;;
+    *) die "preset: unknown preset '$1' (try: Flat, Bass Boost, Treble Boost, Vocal, Loudness, Rock)" ;;
+  esac
+  local json='.' i
+  local pairs=()
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    json="$json | .bands[$i] = ${bands[$i]}"
+    pairs+=("band_$((i + 1)):Gain" "${bands[$i]}")
+  done
+  json="$json | .preamp = $preamp | .preset = \"$disp\" | .eqEnabled = true"
+  pairs+=("preamp:Mult" "$(db_to_mult "$preamp")")
+  update_state "$json"
+  apply_pairs "${pairs[@]}"
+}
+
+cmd_reset() { cmd_preset flat; }
+cmd_eq_enable() { ensure_state; update_state '.eqEnabled = true'; apply_state; }
+cmd_eq_disable() { ensure_state; update_state '.eqEnabled = false'; apply_state; }
+cmd_apply() { apply_state; }
+
+# ---- visualizer settings -----------------------------------------------------
+
+cmd_set_viz() {
+  [ "$#" -eq 2 ] || die "set: need <key> <value>"
+  local key=$1 val=$2 v style canon
+  ensure_state
+  case "$key" in
+    vizEnabled|enabled)
+      case "$val" in
+        true|1|yes|on)   val=true ;;
+        false|0|no|off)  val=false ;;
+        *) die "set: invalid vizEnabled '$val' (use true|false)" ;;
+      esac
+      update_state ".vizEnabled = $val"
+      ;;
+    style)
+      style=$(style_canon "$val") || die "set: invalid style '$val' (try: Dots, Particles, Bars, Mirrored, Wave, Peaks, Aurora)"
+      update_state '.style = $v' --arg v "$style"
+      ;;
+    sensitivity)
+      is_num "$val" || die "set: invalid sensitivity '$val'"
+      v=$(clamp "$val" 0.25 3.0)
+      update_state ".sensitivity = $v"
+      ;;
+    bars)
+      is_num "$val" || die "set: invalid bars '$val'"
+      v=$(clamp_int "$val" 16 64)
+      set_bars "$v"
+      ;;
+    height)
+      is_num "$val" || die "set: invalid height '$val'"
+      v=$(clamp_int "$val" 40 400)
+      update_state ".height = $v"
+      ;;
+    margin)
+      is_num "$val" || die "set: invalid margin '$val'"
+      v=$(clamp_int "$val" 0 200)
+      update_state ".margin = $v"
+      ;;
+    dotSize)
+      is_num "$val" || die "set: invalid dotSize '$val'"
+      v=$(clamp_int "$val" 2 24)
+      update_state ".dotSize = $v"
+      ;;
+    screen)
+      [ -n "$val" ] || die "set: screen must not be empty"
+      update_state '.screen = $v' --arg v "$val"
+      ;;
+    source)
+      canon=$(source_canon "$val") || die "set: invalid source '$val' (try: Spotify, All output)"
+      set_source "$canon"
+      ;;
+    *)
+      die "set: unknown key '$key' (try: vizEnabled, style, sensitivity, bars, height, margin, dotSize, screen, source)"
+      ;;
+  esac
+}
+
+# `set` is shared by the EQ and the visualizer. EQ calls are all-numeric pairs;
+# visualizer calls start with a word key.
+cmd_set() {
+  if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+    cmd_set_bands "$@"
+  else
+    cmd_set_viz "$@"
+  fi
+}
+
+cmd_status() {
+  ensure_state
+  local canon eff
+  canon=$(jq -r '.source // "Spotify"' "$STATE_FILE" 2>/dev/null) || canon="Spotify"
+  case "$canon" in
+    Spotify|'All output') ;;
+    *) canon="Spotify" ;;
+  esac
+  eff=$(resolve_source "$canon") || eff=""
+  jq -c --arg eff "$eff" '. + {effectiveSource: $eff}' "$STATE_FILE"
+}
+
+cmd_toggle() { ensure_state; update_state '.vizEnabled = (.vizEnabled | not)'; }
+
+# ---- selftest: no audio, no display ------------------------------------------
+
+_selftest_fail=0
+assert_eq() { # <actual> <expected> <msg>
+  if [ "$1" = "$2" ]; then
+    printf 'ok   - %s\n' "$3"
+  else
+    printf 'FAIL - %s (got %s, want %s)\n' "$3" "$1" "$2"
+    _selftest_fail=$((_selftest_fail + 1))
+  fi
+}
+
+assert_fails() { # <msg> <cmd...>
+  local msg=$1; shift
+  if "$@" >/dev/null 2>&1; then
+    printf 'FAIL - %s (expected non-zero exit)\n' "$msg"
+    _selftest_fail=$((_selftest_fail + 1))
+  else
+    printf 'ok   - %s\n' "$msg"
+  fi
+}
+
+cmd_selftest() {
+  local tmp self
+  tmp=$(mktemp -d)
+  self=$SELF
+  export SPOTIFY_WAVE_STATE_DIR="$tmp"
+  export SPOTIFY_WAVE_NODE="spotify_wave_selftest_absent"
+  # Point migration at absent files so the defaults path is deterministic.
+  export SPOTIFY_WAVE_EQ_STATE="$tmp/no-eq.json"
+  export SPOTIFY_WAVE_VIS_STATE="$tmp/no-vis.json"
+  local f="$tmp/state.json"
+
+  # cava config: work on a throwaway copy of the real one
+  local real_cava="$tmp/cava" true_cava
+  true_cava=$(SPOTIFY_WAVE_CAVA_CONFIG= cava_config_path)
+  cp "$true_cava" "$real_cava"
+  export SPOTIFY_WAVE_CAVA_CONFIG="$real_cava"
+  assert_eq "$("$self" cava-config-path)" "$real_cava" "cava-config-path resolves override"
+
+  # defaults
+  "$self" status >/dev/null
+  assert_eq "$(jq -r '.eqEnabled' "$f")"     "true"   "default eqEnabled true"
+  assert_eq "$(jq -r '.preamp' "$f")"        "0"      "default preamp 0 dB"
+  assert_eq "$(jq -r '.preset' "$f")"        "Flat"   "default preset Flat"
+  assert_eq "$(jq -r '[.bands[]] | add' "$f")" "0"    "default bands flat"
+  assert_eq "$(jq -r '.vizEnabled' "$f")"    "true"   "default vizEnabled true"
+  assert_eq "$(jq -r '.style' "$f")"         "Dots"   "default style Dots"
+  assert_eq "$(jq -r '.sensitivity' "$f")"   "1.0"    "default sensitivity 1.0"
+  assert_eq "$(jq -r '.bars' "$f")"          "64"     "default bars 64"
+  assert_eq "$(jq -r '.height' "$f")"        "320"    "default height 320"
+  assert_eq "$(jq -r '.margin' "$f")"        "24"     "default margin 24"
+  assert_eq "$(jq -r '.dotSize' "$f")"       "6"      "default dotSize 6"
+  assert_eq "$(jq -r '.screen' "$f")"        "all"    "default screen all"
+  assert_eq "$(jq -r '.source' "$f")"        "Spotify" "default source Spotify"
+
+  # ---- EQ controls ----
+  "$self" set 0 99 >/dev/null
+  "$self" set 1 -99 >/dev/null
+  "$self" set 2 3 >/dev/null
+  assert_eq "$(jq -r '.bands[0]' "$f")" "12"  "gain clamped high to 12"
+  assert_eq "$(jq -r '.bands[1]' "$f")" "-12" "gain clamped low to -12"
+  assert_eq "$(jq -r '.bands[2]' "$f")" "3"   "multi-band set stores value"
+  assert_eq "$(jq -r '.preset' "$f")"   "Custom" "set marks preset Custom"
+  assert_fails "set rejects odd args" "$self" set 0
+  assert_fails "set rejects index > 9" "$self" set 10 1
+  assert_fails "set rejects non-numeric gain" "$self" set 0 abc
+
+  "$self" preamp 99 >/dev/null
+  assert_eq "$(jq -r '.preamp' "$f")" "12" "preamp clamped high"
+  "$self" preamp -99 >/dev/null
+  assert_eq "$(jq -r '.preamp' "$f")" "-12" "preamp clamped low"
+  assert_fails "preamp rejects non-numeric" "$self" preamp abc
+
+  "$self" preset "Bass Boost" >/dev/null
+  assert_eq "$(jq -r '.bands[0]' "$f")" "6"  "preset loads band array"
+  assert_eq "$(jq -r '.preamp' "$f")"  "-1" "preset loads preamp dB"
+  assert_eq "$(jq -r '.preset' "$f")"  "Bass Boost" "preset stores display name"
+  assert_eq "$(jq -r '.eqEnabled' "$f")" "true" "preset enables EQ"
+  assert_fails "preset rejects unknown name" "$self" preset nope
+
+  "$self" eq-disable >/dev/null
+  assert_eq "$(jq -r '.eqEnabled' "$f")" "false" "eq-disable flips flag"
+  assert_eq "$(jq -r '.bands[0]' "$f")"  "6"     "eq-disable keeps stored bands"
+  "$self" set 0 6 3 6 >/dev/null
+  assert_eq "$(jq -r '.eqEnabled' "$f")" "false" "disabled set keeps eqEnabled false"
+  assert_eq "$(jq -r '.bands[3]' "$f")"  "6"     "disabled set still stores band"
+  "$self" eq-enable >/dev/null
+  assert_eq "$(jq -r '.eqEnabled' "$f")" "true"  "eq-enable flips flag back"
+  "$self" reset >/dev/null
+  assert_eq "$(jq -r '[.bands[]] | add' "$f")" "0"    "reset flattens bands"
+  assert_eq "$(jq -r '.preamp' "$f")"          "0"    "reset restores preamp 0"
+  assert_eq "$(jq -r '.preset' "$f")"          "Flat" "reset restores preset Flat"
+
+  # ---- visualizer controls ----
+  "$self" set style wave >/dev/null
+  assert_eq "$(jq -r '.style' "$f")" "Wave" "set style canonicalises case"
+  "$self" set style aurora >/dev/null
+  assert_eq "$(jq -r '.style' "$f")" "Aurora" "set style accepts Aurora"
+  assert_fails "set rejects bad style enum" "$self" set style Foo
+  assert_fails "set rejects bad key" "$self" set nope 1
+
+  "$self" set sensitivity 0 >/dev/null
+  assert_eq "$(jq -r '.sensitivity' "$f")" "0.25" "sensitivity clamped low"
+  "$self" set sensitivity 99 >/dev/null
+  assert_eq "$(jq -r '.sensitivity' "$f")" "3" "sensitivity clamped high"
+  "$self" set bars 1 >/dev/null
+  assert_eq "$(jq -r '.bars' "$f")" "16" "bars clamped low"
+  "$self" set bars 999 >/dev/null
+  assert_eq "$(jq -r '.bars' "$f")" "64" "bars clamped high"
+  "$self" set height 1 >/dev/null
+  assert_eq "$(jq -r '.height' "$f")" "40" "height clamped low"
+  "$self" set height 9999 >/dev/null
+  assert_eq "$(jq -r '.height' "$f")" "400" "height clamped high"
+  "$self" set margin -5 >/dev/null
+  assert_eq "$(jq -r '.margin' "$f")" "0" "margin clamped low"
+  "$self" set margin 500 >/dev/null
+  assert_eq "$(jq -r '.margin' "$f")" "200" "margin clamped high"
+  "$self" set dotSize 1 >/dev/null
+  assert_eq "$(jq -r '.dotSize' "$f")" "2" "dotSize clamped low"
+  "$self" set dotSize 100 >/dev/null
+  assert_eq "$(jq -r '.dotSize' "$f")" "24" "dotSize clamped high"
+  "$self" set screen "DP-1" >/dev/null
+  assert_eq "$(jq -r '.screen' "$f")" "DP-1" "screen stores monitor name"
+  assert_fails "set rejects empty screen" "$self" set screen ""
+
+  # bars <-> config/cava stay in lockstep
+  local before after
+  before=$(grep -v '^bars' "$real_cava")
+  "$self" set bars 32 >/dev/null
+  assert_eq "$(grep -E '^bars[[:space:]]*=' "$real_cava")" "bars = 32" "set bars 32 rewrites config/cava"
+  after=$(grep -v '^bars' "$real_cava")
+  [ "$before" = "$after" ] && before=true || before=false
+  assert_eq "$before" "true" "set bars 32 leaves other cava lines unchanged"
+
+  # source <-> config/cava stay in lockstep
+  "$self" set source "All output" >/dev/null
+  assert_eq "$(jq -r '.source' "$f")" "All output" "set source All output updates state"
+  assert_eq "$(grep -E '^source[[:space:]]*=' "$real_cava")" "source = auto" "set source All output writes auto"
+  "$self" set source all >/dev/null
+  assert_eq "$(jq -r '.source' "$f")" "All output" "set source accepts alias 'all'"
+  "$self" set source SPOTIFY >/dev/null
+  assert_eq "$(jq -r '.source' "$f")" "Spotify" "set source accepts case-insensitive 'SPOTIFY'"
+  assert_eq "$(grep -E '^source[[:space:]]*=' "$real_cava")" "source = spotify_wave.monitor" "set source Spotify writes spotify_wave.monitor"
+  assert_fails "set rejects bad source" "$self" set source mic
+
+  # resolve/status effectiveSource
+  assert_eq "$("$self" status | jq -r '.effectiveSource')" "spotify_wave.monitor" "status reports effectiveSource"
+  "$self" set source "All output" >/dev/null
+  assert_eq "$("$self" status | jq -r '.effectiveSource')" "auto" "effectiveSource auto for All output"
+
+  # ensure-source reconciles config/cava
+  "$self" set source Spotify >/dev/null
+  assert_eq "$(SPOTIFY_WAVE_CAVA_CONFIG="$real_cava" "$self" ensure-source)" "same" "ensure-source no-ops when resolved"
+  sed -E "s/^source[[:space:]]*=.*/source = auto/" "$real_cava" > "$real_cava.t" && mv "$real_cava.t" "$real_cava"
+  assert_eq "$("$self" ensure-source)" "changed" "ensure-source rewrites when resolution differs"
+  assert_eq "$(grep -E '^source[[:space:]]*=' "$real_cava")" "source = spotify_wave.monitor" "ensure-source writes resolved monitor"
+
+  # bars line absent: must be inserted under [general]
+  grep -v '^bars' "$real_cava" > "$real_cava.nb" && mv "$real_cava.nb" "$real_cava"
+  "$self" set bars 20 >/dev/null
+  assert_eq "$(grep -E '^bars[[:space:]]*=' "$real_cava")" "bars = 20" "set bars inserts missing bars line"
+  assert_eq "$(awk '/^\[general\]/{g=NR} /^bars[[:space:]]*=/{b=NR} END{print (b>g)?"true":"false"}' "$real_cava")" "true" "inserted bars line sits under [general]"
+
+  # viz toggle
+  "$self" set vizEnabled true >/dev/null
+  "$self" toggle >/dev/null
+  assert_eq "$(jq -r '.vizEnabled' "$f")" "false" "toggle flips vizEnabled off"
+  "$self" toggle >/dev/null
+  assert_eq "$(jq -r '.vizEnabled' "$f")" "true" "toggle flips vizEnabled on"
+
+  # status survives a missing config/cava
+  assert_eq "$(SPOTIFY_WAVE_CAVA_CONFIG="$tmp/nope" "$self" status >/dev/null && echo true || echo false)" "true" "status works without config/cava"
+
+  # verify-source exit codes (headless)
+  local rc no_cava_cfg="$tmp/no-such-cava-config"
+  SPOTIFY_WAVE_CAVA_CONFIG="$no_cava_cfg" "$self" verify-source >/dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "$rc" "2" "verify-source exits 2 without cava"
+  SPOTIFY_WAVE_SINKS='' SPOTIFY_WAVE_SOURCES='' SPOTIFY_WAVE_CAVA_CONFIG="$true_cava" \
+    "$self" verify-source >/dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "$rc" "2" "verify-source exits 2 when expected monitor absent"
+  if command -v pactl >/dev/null 2>&1 && pgrep -x cava >/dev/null 2>&1; then
+    SPOTIFY_WAVE_CAVA_CONFIG="$true_cava" SPOTIFY_WAVE_EXPECT_SOURCE=bogus.monitor \
+      "$self" verify-source >/dev/null 2>&1 && rc=0 || rc=$?
+    assert_eq "$rc" "1" "verify-source exits 1 on forced mismatch"
+  else
+    printf 'skip - verify-source live checks (no pactl or cava)\n'
+  fi
+
+  # self-heal: corrupt state, status must rewrite defaults
+  printf 'not json' > "$f"
+  "$self" status >/dev/null
+  assert_eq "$(jq -r '.style' "$f")" "Dots" "status self-heals corrupt state"
+  assert_eq "$(jq -r '.bands | length' "$f")" "10" "self-healed state has 10 bands"
+
+  # missing state file
+  rm -f "$f"
+  "$self" status >/dev/null
+  assert_eq "$(jq -r 'type' "$f")" "object" "status recreates missing state"
+
+  # first-run migration from the old EQ + visualizer state files
+  rm -f "$f"
+  printf '{"enabled":false,"preamp":-3,"preset":"Vocal","bands":[1,2,3,4,5,6,7,8,9,10]}' > "$tmp/old-eq.json"
+  printf '{"enabled":false,"style":"Wave","source":"All output","screen":"DP-1","sensitivity":2.5,"bars":32,"height":111,"margin":9,"dotSize":8}' > "$tmp/old-vis.json"
+  SPOTIFY_WAVE_EQ_STATE="$tmp/old-eq.json" SPOTIFY_WAVE_VIS_STATE="$tmp/old-vis.json" "$self" status >/dev/null
+  assert_eq "$(jq -r '.eqEnabled' "$f")"    "false" "migration carries eqEnabled"
+  assert_eq "$(jq -r '.preamp' "$f")"       "-3"    "migration carries preamp"
+  assert_eq "$(jq -r '.preset' "$f")"       "Vocal" "migration carries preset"
+  assert_eq "$(jq -r '.bands[9]' "$f")"     "10"    "migration carries bands"
+  assert_eq "$(jq -r '.vizEnabled' "$f")"   "false" "migration carries vizEnabled"
+  assert_eq "$(jq -r '.style' "$f")"        "Wave"  "migration carries style"
+  assert_eq "$(jq -r '.source' "$f")"       "All output" "migration carries source"
+  assert_eq "$(jq -r '.bars' "$f")"         "32"    "migration carries bars"
+  assert_eq "$(jq -r '.height' "$f")"       "111"   "migration carries height"
+  # migration does not delete the old files
+  assert_eq "$([ -f "$tmp/old-eq.json" ] && echo true || echo false)" "true" "migration keeps old EQ file"
+  assert_eq "$([ -f "$tmp/old-vis.json" ] && echo true || echo false)" "true" "migration keeps old visualizer file"
+
+  # find-node exits non-zero and quietly when the sink is absent
+  if "$self" find-node >"$tmp/out" 2>"$tmp/err"; then
+    printf 'FAIL - find-node exits 1 when sink absent\n'
+    _selftest_fail=$((_selftest_fail + 1))
+  else
+    assert_eq "$(wc -c < "$tmp/err" | tr -d ' ')" "0" "find-node is quiet when sink absent"
+  fi
+
+  # flock round-trip: concurrent writers must not corrupt the file
+  "$self" status >/dev/null
+  local i
+  for i in $(seq 1 20); do
+    "$self" set margin "$i" >/dev/null 2>&1 &
+  done
+  wait || true
+  assert_eq "$(jq -r 'type' "$f")" "object" "concurrent writes leave valid JSON"
+  assert_eq "$(jq -r '(.margin >= 0 and .margin <= 200)' "$f")" "true" "concurrent writes keep margin in range"
+
+  rm -rf "$tmp"
+  if [ "$_selftest_fail" -eq 0 ]; then
+    printf 'selftest: OK\n'
+  else
+    printf 'selftest: %d failure(s)\n' "$_selftest_fail" >&2
+    return 1
+  fi
+}
+
+# ---- main --------------------------------------------------------------------
+
+main() {
+  [ "$#" -gt 0 ] || { usage >&2; exit 1; }
+  local cmd=$1; shift
+  case "$cmd" in
+    find-node)      find_node ;;
+    status)         cmd_status ;;
+    set)            cmd_set "$@" ;;
+    preamp)         cmd_preamp "$@" ;;
+    preset)         cmd_preset "$@" ;;
+    reset)          cmd_reset "$@" ;;
+    eq-enable)      cmd_eq_enable "$@" ;;
+    eq-disable)     cmd_eq_disable "$@" ;;
+    enable|eq-on)   cmd_eq_enable "$@" ;;
+    disable|eq-off) cmd_eq_disable "$@" ;;
+    apply)          cmd_apply "$@" ;;
+    toggle)         cmd_toggle "$@" ;;
+    cava-config-path) cava_config_path ;;
+    ensure-source)  cmd_ensure_source "$@" ;;
+    verify-source)  cmd_verify_source "$@" ;;
+    selftest)       cmd_selftest "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command '$cmd' (try --help)" ;;
+  esac
+}
+
+main "$@"

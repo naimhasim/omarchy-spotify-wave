@@ -1,0 +1,44 @@
+# cava config for naimhasim.spotify-wave
+#
+# Consumed as:  cava -p <this file>
+# Deliberately NOT installed to ~/.config/cava/config so any user cava setup
+# is left untouched.
+#
+# The `source` line is managed by bin/spotify-wave (`set source`), which
+# rewrites it in place; edit it via the helper, not here.
+#   Spotify     -> spotify_wave.monitor: the naimhasim.spotify-wave filter-chain
+#                  sink, so only Spotify (official client / spotifyd / librespot)
+#                  shows and the EQ is in the path.
+#   All output  -> auto: cava's currently selected output monitor, i.e. all
+#                  system audio.
+# `auto` was verified on cava 0.10.7 to follow the default sink monitor (never
+# the microphone).
+
+[general]
+framerate = 60
+bars = 64
+autosens = 1
+sensitivity = 100
+lower_cutoff_freq = 50
+higher_cutoff_freq = 16000
+sleep_timer = 0
+
+[input]
+method = pipewire
+source = spotify_wave.monitor
+sample_rate = 48000
+sample_bits = 16
+channels = 2
+
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 1000
+bar_delimiter = 59
+frame_delimiter = 10
+channels = mono
+mono_option = average
+
+[smoothing]
+noise_reduction = 77
