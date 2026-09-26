@@ -488,7 +488,7 @@ Panel {
             checked: !root.eqEnabled
             foreground: root.bar.foreground
             fontFamily: root.bar.fontFamily
-            onClicked: root.setBypass(!root.eqEnabled)
+            onClicked: root.setBypass(root.eqEnabled)
           }
 
           Button {
