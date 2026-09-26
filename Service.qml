@@ -728,41 +728,61 @@ Item {
           }
         }
 
-        Canvas {
-          id: waveCanvas
+        // A hidden layer window releases the Canvas texture and a plain
+        // requestPaint() does not bring it back (verified on Qt 6.11), so the
+        // Canvas is created only while the strip is actually visible. That
+        // makes a re-show behave exactly like first load, when painting works.
+        Loader {
+          id: waveLoader
           anchors.fill: parent
-          visible: root.cfg.style === "Wave"
-          antialiasing: true
-          // Bound to the theme so a theme change re-evaluates this and the
-          // Canvas repaints (see onWaveColorChanged). QML color.toString()
-          // yields "#rrggbb", which Canvas accepts verbatim.
-          readonly property color waveColor: Color.accent
-          onWaveColorChanged: requestPaint()
-          onVisibleChanged: if (visible) requestPaint()
-          Component.onCompleted: requestPaint()
-          onWidthChanged: requestPaint()
-          onHeightChanged: requestPaint()
-          onPaint: {
-            var n = root.activeBars
-            var ctx = getContext("2d")
-            ctx.clearRect(0, 0, width, height)
-            if (n < 2) return
-            var lw = Math.max(1, root.cfg.dotSize * 0.4)
-            ctx.lineWidth = lw
-            ctx.lineJoin = "round"
-            ctx.strokeStyle = waveColor.toString()
-            ctx.beginPath()
-            for (var i = 0; i < n; i++) {
-              var x = root.centerX(i, width)
-              var y = height - lw - root.levelAt(i) * Math.max(0, height - 2 * lw)
-              if (i === 0) ctx.moveTo(x, y)
-              else ctx.lineTo(x, y)
+          active: root.cfg.style === "Wave" && strip.visible
+          sourceComponent: waveComponent
+        }
+
+        Component {
+          id: waveComponent
+          Canvas {
+            id: waveCanvas
+            anchors.fill: parent
+            antialiasing: true
+            // Both attributes the stroke depends on are explicit reactive
+            // properties, so every change (theme accent, dot size) repaints
+            // instead of only the current level frame. QML color.toString()
+            // yields "#rrggbb", which Canvas accepts verbatim.
+            readonly property color waveColor: Color.accent
+            readonly property real waveLineWidth: Math.max(1, root.cfg.dotSize * 0.4)
+            onWaveColorChanged: requestPaint()
+            onWaveLineWidthChanged: requestPaint()
+            // The first paint lands before the surface is exposed and has its
+            // final size, so defer a repaint past layout. Never rely on
+            // onLevelsChanged alone: cava may not have produced a frame yet.
+            function repaintSoon() { Qt.callLater(requestPaint) }
+            onVisibleChanged: if (visible) repaintSoon()
+            Component.onCompleted: repaintSoon()
+            onWidthChanged: if (visible) repaintSoon()
+            onHeightChanged: if (visible) repaintSoon()
+            onPaint: {
+              var n = root.activeBars
+              var ctx = getContext("2d")
+              ctx.clearRect(0, 0, width, height)
+              if (n < 2) return
+              var lw = waveLineWidth
+              ctx.lineWidth = lw
+              ctx.lineJoin = "round"
+              ctx.strokeStyle = waveColor.toString()
+              ctx.beginPath()
+              for (var i = 0; i < n; i++) {
+                var x = root.centerX(i, width)
+                var y = height - lw - root.levelAt(i) * Math.max(0, height - 2 * lw)
+                if (i === 0) ctx.moveTo(x, y)
+                else ctx.lineTo(x, y)
+              }
+              ctx.stroke()
             }
-            ctx.stroke()
-          }
-          Connections {
-            target: root
-            function onLevelsChanged() { if (waveCanvas.visible) waveCanvas.requestPaint() }
+            Connections {
+              target: root
+              function onLevelsChanged() { if (waveCanvas.visible) waveCanvas.requestPaint() }
+            }
           }
         }
       }
