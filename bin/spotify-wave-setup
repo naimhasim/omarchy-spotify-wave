@@ -9,6 +9,11 @@
 # visualizer's monitor share it, so no reconciliation with another plugin is
 # needed.
 #
+# filter-chain.service can host other filter-chains too, so its enabled state
+# is tracked in setup.json (next to state.json). install records the state it
+# found and only enables the unit when it is not already enabled; uninstall
+# only disables it again when this plugin was the one that enabled it.
+#
 # Idempotent: safe to run install or uninstall repeatedly. Never restarts
 # pipewire.service; pipewire-pulse.service is only restarted when its fragment
 # actually changes (pulse.rules are read once at module load).
@@ -29,6 +34,7 @@ PW_DST="$CONFIG_HOME/pipewire/filter-chain.conf.d/60-spotify-wave.conf"
 PP_DST="$CONFIG_HOME/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf"
 WP_DST="$CONFIG_HOME/wireplumber/wireplumber.conf.d/60-spotify-wave.conf"
 STATE_DIR="$STATE_HOME/spotify-wave"
+SETUP_FILE="$STATE_DIR/setup.json"
 
 usage() {
   cat <<'EOF'
@@ -38,15 +44,69 @@ Commands:
   install            Install the PipeWire, pipewire-pulse and WirePlumber config
                      fragments, enable and restart filter-chain.service, restart
                      wireplumber.service, seed the state file on first run and
-                     apply the saved state.
-  uninstall          Remove the installed config, restart the services and keep
-                     the state file.
-  uninstall --purge  Same, but also delete the state file directory.
+                     apply the saved state. Records filter-chain.service's prior
+                     enabled state and only enables the unit when it is not
+                     already enabled.
+  uninstall          Remove the installed config, restore filter-chain.service's
+                     pre-install enabled state (only disable it when install
+                     enabled it), restart the services and keep the state file.
+  uninstall --purge  Same, but also delete the state directory.
   -h, --help         Show this help.
 EOF
 }
 
 die() { printf 'spotify-wave-setup: %s\n' "$*" >&2; exit 1; }
+
+# systemctl --user is-enabled writes the state to stdout but exits non-zero for
+# anything but "enabled", and prints nothing when the unit is missing. Normalise
+# to the setup.json vocabulary; empty/odd output becomes "unknown".
+filter_chain_state() {
+  local raw
+  raw=$(systemctl --user is-enabled filter-chain.service 2>/dev/null || true)
+  case "$raw" in
+    enabled|enabled-runtime) printf 'enabled\n' ;;
+    disabled)                printf 'disabled\n' ;;
+    static)                  printf 'static\n' ;;
+    linked|linked-runtime)   printf 'linked\n' ;;
+    masked|masked-runtime)   printf 'masked\n' ;;
+    *)                       printf 'unknown\n' ;;
+  esac
+}
+
+is_enabled_state() { # <state>: true when systemd reports (or would start) it
+  case "$1" in enabled|linked) return 0 ;; *) return 1 ;; esac
+}
+
+# setup.json is shared state next to state.json; serialise with the helper's
+# lock so concurrent runs cannot interleave (see bin/spotify-wave).
+with_state_lock() { # <cmd...>
+  ( flock -x 9; "$@" ) 9>"$STATE_DIR/.lock"
+}
+
+setup_before() { # earliest recorded pre-install state, empty when no record
+  [ -f "$SETUP_FILE" ] || return 0
+  jq -r '.filterChainEnabledBefore // empty' "$SETUP_FILE" 2>/dev/null || true
+}
+
+setup_owned() { # true only when this plugin enabled filter-chain.service
+  [ -f "$SETUP_FILE" ] || { printf 'false\n'; return 0; }
+  jq -r 'if .filterChainEnabledByPlugin == true then "true" else "false" end' \
+    "$SETUP_FILE" 2>/dev/null || printf 'false\n'
+}
+
+_write_setup() { # <before> <owned>; caller holds the lock
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/setup.json.XXXXXX")
+  jq -n --arg before "$1" --argjson owned "$2" \
+    '{filterChainEnabledBefore: $before, filterChainEnabledByPlugin: $owned}' \
+    > "$tmp"
+  mv "$tmp" "$SETUP_FILE"
+}
+
+record_setup() { # <before> <owned>
+  mkdir -p "$STATE_DIR"
+  with_state_lock _write_setup "$1" "$2"
+}
 
 cmd_install() {
   [ -f "$PW_SRC" ] || die "missing source config: $PW_SRC"
@@ -58,6 +118,27 @@ cmd_install() {
   local pulse_changed=0
   cmp -s "$PP_SRC" "$PP_DST" 2>/dev/null || pulse_changed=1
 
+  # Ownership: capture filter-chain.service's enablement before changing
+  # anything, and keep the earliest record on a repeated install. The unit can
+  # host other filter-chains, so only enable it when needed and claim ownership
+  # only when this install is what enabled it.
+  local current before owned
+  current=$(filter_chain_state)
+  before=$(setup_before)
+  [ -n "$before" ] || before=$current
+  owned=$(setup_owned)
+
+  if is_enabled_state "$before"; then
+    owned=false            # already enabled before us: not ours to disable later
+    is_enabled_state "$current" \
+      || systemctl --user enable filter-chain.service >/dev/null 2>&1 || true
+  elif ! is_enabled_state "$current"; then
+    if systemctl --user enable filter-chain.service >/dev/null 2>&1; then
+      owned=true
+    fi
+  fi
+  record_setup "$before" "$owned"
+
   mkdir -p "$(dirname "$PW_DST")" "$(dirname "$PP_DST")" "$(dirname "$WP_DST")"
   install -m 0644 "$PW_SRC" "$PW_DST"
   install -m 0644 "$PP_SRC" "$PP_DST"
@@ -65,7 +146,6 @@ cmd_install() {
 
   # filter-chain.service owns the spotify_wave sink; wireplumber applies the
   # stream rules.
-  systemctl --user enable filter-chain.service >/dev/null 2>&1 || true
   systemctl --user restart filter-chain.service >/dev/null 2>&1 \
     || printf 'spotify-wave-setup: warning: could not restart filter-chain.service\n' >&2
   systemctl --user restart wireplumber.service >/dev/null 2>&1 \
@@ -86,7 +166,8 @@ cmd_install() {
 
   printf 'spotify-wave-setup: installed\n'
   printf '  %s\n  %s\n  %s\n' "$PW_DST" "$PP_DST" "$WP_DST"
-  printf '  filter-chain.service enabled; filter-chain/wireplumber restarted'
+  printf '  filter-chain.service ready (was %s, enabled by plugin: %s)' "$before" "$owned"
+  printf '; filter-chain/wireplumber restarted'
   if [ "$pulse_changed" -eq 1 ]; then
     printf '; pipewire-pulse restarted'
   fi
@@ -106,10 +187,17 @@ cmd_uninstall() {
     pulse_had_file=1
   fi
 
+  # Only disable filter-chain.service when install was what enabled it; a unit
+  # shared with other filter-chains (or a legacy install with no setup.json)
+  # must be left untouched.
+  local owned
+  owned=$(setup_owned)
+
   rm -f "$PW_DST" "$PP_DST" "$WP_DST"
 
-  # Fully clean up the unit enabled by install (best effort; ignore errors).
-  systemctl --user disable filter-chain.service >/dev/null 2>&1 || true
+  if [ "$owned" = true ]; then
+    systemctl --user disable filter-chain.service >/dev/null 2>&1 || true
+  fi
 
   systemctl --user restart filter-chain.service >/dev/null 2>&1 \
     || printf 'spotify-wave-setup: warning: could not restart filter-chain.service\n' >&2
@@ -119,6 +207,8 @@ cmd_uninstall() {
     systemctl --user restart pipewire-pulse.service >/dev/null 2>&1 \
       || printf 'spotify-wave-setup: warning: could not restart pipewire-pulse.service\n' >&2
   fi
+
+  rm -f "$SETUP_FILE"
 
   if [ "$purge" -eq 1 ]; then
     rm -rf "$STATE_DIR"

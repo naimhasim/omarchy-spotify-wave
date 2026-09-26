@@ -77,10 +77,13 @@ omarchy plugin disable naimhasim.spotify-wave
 omarchy plugin remove naimhasim.spotify-wave
 ```
 
-`uninstall` removes the installed fragments and disables `filter-chain.service`;
-`--purge` also deletes the state file. Drop `--purge` to keep the saved settings
-across a reinstall. `cava` is a system package and is left installed; remove it
-with `omarchy pkg drop cava` if unwanted.
+`uninstall` removes the installed fragments and restores `filter-chain.service`
+to the enabled state it had before install; it is only disabled again when the
+install was what enabled it, so a unit shared with other filter-chains is left
+untouched. `--purge` also deletes the state directory (settings and the
+install's enablement record). Drop `--purge` to keep the saved settings across a
+reinstall. `cava` is a system package and is left installed; remove it with
+`omarchy pkg drop cava` if unwanted.
 
 ## Layout
 
