@@ -29,9 +29,11 @@ STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 
 PW_SRC="$PLUGIN_DIR/config/pipewire/filter-chain.conf.d/60-spotify-wave.conf"
 PP_SRC="$PLUGIN_DIR/config/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf"
+CC_SRC="$PLUGIN_DIR/config/pipewire/client.conf.d/60-spotify-wave.conf"
 WP_SRC="$PLUGIN_DIR/config/wireplumber/wireplumber.conf.d/60-spotify-wave.conf"
 PW_DST="$CONFIG_HOME/pipewire/filter-chain.conf.d/60-spotify-wave.conf"
 PP_DST="$CONFIG_HOME/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf"
+CC_DST="$CONFIG_HOME/pipewire/client.conf.d/60-spotify-wave.conf"
 WP_DST="$CONFIG_HOME/wireplumber/wireplumber.conf.d/60-spotify-wave.conf"
 STATE_DIR="$STATE_HOME/spotify-wave"
 SETUP_FILE="$STATE_DIR/setup.json"
@@ -41,12 +43,12 @@ usage() {
 Usage: spotify-wave-setup <command>
 
 Commands:
-  install            Install the PipeWire, pipewire-pulse and WirePlumber config
-                     fragments, enable and restart filter-chain.service, restart
-                     wireplumber.service, seed the state file on first run and
-                     apply the saved state. Records filter-chain.service's prior
-                     enabled state and only enables the unit when it is not
-                     already enabled.
+  install            Install the PipeWire client/filter-chain, pipewire-pulse
+                     and WirePlumber config fragments, enable and restart
+                     filter-chain.service, restart wireplumber.service, seed the
+                     state file on first run and apply the saved state. Records
+                     filter-chain.service's prior enabled state and only enables
+                     the unit when it is not already enabled.
   uninstall          Remove the installed config, restore filter-chain.service's
                      pre-install enabled state (only disable it when install
                      enabled it), restart the services and keep the state file.
@@ -111,6 +113,7 @@ record_setup() { # <before> <owned>
 cmd_install() {
   [ -f "$PW_SRC" ] || die "missing source config: $PW_SRC"
   [ -f "$PP_SRC" ] || die "missing source config: $PP_SRC"
+  [ -f "$CC_SRC" ] || die "missing source config: $CC_SRC"
   [ -f "$WP_SRC" ] || die "missing source config: $WP_SRC"
 
   # pipewire-pulse must be restarted to pick up pulse.rules, so only do it when
@@ -139,13 +142,17 @@ cmd_install() {
   fi
   record_setup "$before" "$owned"
 
-  mkdir -p "$(dirname "$PW_DST")" "$(dirname "$PP_DST")" "$(dirname "$WP_DST")"
+  mkdir -p "$(dirname "$PW_DST")" "$(dirname "$PP_DST")" \
+    "$(dirname "$CC_DST")" "$(dirname "$WP_DST")"
   install -m 0644 "$PW_SRC" "$PW_DST"
   install -m 0644 "$PP_SRC" "$PP_DST"
+  install -m 0644 "$CC_SRC" "$CC_DST"
   install -m 0644 "$WP_SRC" "$WP_DST"
 
   # filter-chain.service owns the spotify_wave sink; wireplumber applies the
-  # stream rules.
+  # stream rules. client.conf.d is read by each native client at startup, so no
+  # service restart is needed for it (the running Spotify picks it up on its
+  # next start).
   systemctl --user restart filter-chain.service >/dev/null 2>&1 \
     || printf 'spotify-wave-setup: warning: could not restart filter-chain.service\n' >&2
   systemctl --user restart wireplumber.service >/dev/null 2>&1 \
@@ -165,7 +172,7 @@ cmd_install() {
   "$HELPER" apply
 
   printf 'spotify-wave-setup: installed\n'
-  printf '  %s\n  %s\n  %s\n' "$PW_DST" "$PP_DST" "$WP_DST"
+  printf '  %s\n  %s\n  %s\n  %s\n' "$PW_DST" "$PP_DST" "$CC_DST" "$WP_DST"
   printf '  filter-chain.service ready (was %s, enabled by plugin: %s)' "$before" "$owned"
   printf '; filter-chain/wireplumber restarted'
   if [ "$pulse_changed" -eq 1 ]; then
@@ -193,7 +200,7 @@ cmd_uninstall() {
   local owned
   owned=$(setup_owned)
 
-  rm -f "$PW_DST" "$PP_DST" "$WP_DST"
+  rm -f "$PW_DST" "$PP_DST" "$CC_DST" "$WP_DST"
 
   if [ "$owned" = true ]; then
     systemctl --user disable filter-chain.service >/dev/null 2>&1 || true

@@ -31,7 +31,7 @@ audio inside the shell.
 
 ## How it works
 
-`bin/spotify-wave-setup install` installs three fragments and enables the
+`bin/spotify-wave-setup install` installs four fragments and enables the
 filter-chain host:
 
 - `config/pipewire/filter-chain.conf.d/60-spotify-wave.conf` — the graph: a
@@ -39,12 +39,20 @@ filter-chain host:
   1k, 2k, 4k, 8k, 16k Hz (Q = 1.0). It publishes the `spotify_wave` sink
   (`node.description = "Spotify Wave"`) and the `spotify_wave_output` playback
   node that follows the current default sink.
+- `config/pipewire/client.conf.d/60-spotify-wave.conf` — a `stream.rules` match
+  applied by the client itself. This is what routes the **official Spotify
+  desktop client**, which connects to PipeWire directly (native protocol) and
+  therefore never passes through pipewire-pulse's `pulse.rules`.
 - `config/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf` — a
-  `pulse.rules` match that routes the Spotify stream (official client,
-  spotifyd, librespot) into `spotify_wave`.
+  `pulse.rules` match that routes PulseAudio-protocol Spotify streams (the
+  librespot / spotifyd backends) into `spotify_wave`.
 - `config/wireplumber/wireplumber.conf.d/60-spotify-wave.conf` — the companion
   that sets `state.restore-target = false` so WirePlumber does not restore a
-  previous target over the pulse-assigned one.
+  previous target over the assigned one.
+
+Both routing fragments set the same `target.object = "spotify_wave"` and use
+the same matches, so exactly one of them fires for any given Spotify client
+depending on whether it speaks the native or PulseAudio protocol.
 
 `spotify_wave` is a virtual sink: do **not** set it as the default output.
 Only the Spotify stream is moved into it. To listen to Spotify without the EQ,
@@ -110,6 +118,7 @@ bin/spotify-wave         helper CLI (owns state; writes config/cava)
 bin/spotify-wave-setup   installs/removes the PipeWire/WirePlumber fragments
 config/cava              cava configuration consumed by Service.qml
 config/pipewire/filter-chain.conf.d/60-spotify-wave.conf
+config/pipewire/client.conf.d/60-spotify-wave.conf
 config/pipewire/pipewire-pulse.conf.d/60-spotify-wave.conf
 config/wireplumber/wireplumber.conf.d/60-spotify-wave.conf
 ```
