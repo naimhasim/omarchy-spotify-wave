@@ -187,7 +187,6 @@ valid_state() {
        and (.margin | type == "number")
        and (.dotSize | type == "number")
        and (.screen | type == "string")
-       and (.source | IN("Spotify","All output"))
      ' "$STATE_FILE" >/dev/null 2>&1
 }
 
@@ -225,16 +224,18 @@ ensure_state() {
   [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR"
   if [ -f "$STATE_FILE" ]; then
     if valid_state; then
-      # Valid state, possibly written before `source` existed: add just that
-      # key (or fix a bad value) without touching the user's other settings.
-      if ! jq -e '.source | IN("Spotify","All output")' "$STATE_FILE" >/dev/null 2>&1; then
-        local tmp
+      # Structurally valid, but possibly written before `source` existed (or
+      # with an alias / a non-numeric band cell). Repair just those fields via
+      # the locked atomic write, never resetting the user's other settings.
+      local canon tmp
+      canon=$(source_canon "$(jq -r '.source // ""' "$STATE_FILE" 2>/dev/null)") || canon="Spotify"
+      if jq -e --arg s "$canon" \
+            '.source != $s or (.bands | any(.[]; type != "number"))' \
+            "$STATE_FILE" >/dev/null 2>&1; then
         tmp=$(mktemp "${STATE_FILE}.XXXXXX")
-        if jq '.source = "Spotify"' "$STATE_FILE" > "$tmp" 2>/dev/null; then
-          mv "$tmp" "$STATE_FILE"
-        else
-          rm -f "$tmp"
-        fi
+        with_state_lock _update_state_locked "$tmp" \
+          '.source = $s | .bands = [.bands[] | if type == "number" then . else 0 end]' \
+          --arg s "$canon"
       fi
       return 0
     fi
@@ -869,6 +870,20 @@ cmd_selftest() {
   "$self" toggle >/dev/null
   assert_eq "$(jq -r '.vizEnabled' "$f")" "true" "toggle flips vizEnabled on"
 
+  # source-only repair: a valid state missing/invalidating `source` keeps data
+  jq 'del(.source) | .preamp = -7 | .preset = "Vocal" | .bands[0] = 5 | .style = "Wave"' "$f" > "$f.t" && mv "$f.t" "$f"
+  "$self" status >/dev/null
+  assert_eq "$(jq -r '.source' "$f")"   "Spotify" "repair restores missing source"
+  assert_eq "$(jq -r '.preamp' "$f")"   "-7"      "repair keeps preamp"
+  assert_eq "$(jq -r '.preset' "$f")"   "Vocal"   "repair keeps preset"
+  assert_eq "$(jq -r '.bands[0]' "$f")" "5"       "repair keeps bands"
+  assert_eq "$(jq -r '.style' "$f")"    "Wave"    "repair keeps style"
+  jq '.source = "all" | .bands[1] = "bad"' "$f" > "$f.t" && mv "$f.t" "$f"
+  "$self" status >/dev/null
+  assert_eq "$(jq -r '.source' "$f")"   "All output" "repair canonicalises source alias"
+  assert_eq "$(jq -r '.bands[1]' "$f")" "0"          "repair coerces non-numeric band to 0"
+  "$self" set source Spotify >/dev/null
+
   # status survives a missing config/cava
   assert_eq "$(SPOTIFY_WAVE_CAVA_CONFIG="$tmp/nope" "$self" status >/dev/null && echo true || echo false)" "true" "status works without config/cava"
 
@@ -892,6 +907,7 @@ cmd_selftest() {
   "$self" status >/dev/null
   assert_eq "$(jq -r '.style' "$f")" "Dots" "status self-heals corrupt state"
   assert_eq "$(jq -r '.bands | length' "$f")" "10" "self-healed state has 10 bands"
+  assert_eq "$(jq -r '.source' "$f")" "Spotify" "self-healed state has source"
 
   # missing state file
   rm -f "$f"

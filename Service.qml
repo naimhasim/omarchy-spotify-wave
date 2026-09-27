@@ -206,6 +206,7 @@ Item {
   // setter also terminates). A one-shot timer SIGKILLs if it somehow survives.
   function stopCava() {
     sourceCheckTimer.stop()
+    cavaBackoffTimer.stop()
     if (!cavaProc.running) return
     cavaProc.signal(15)
     cavaProc.running = false
@@ -315,10 +316,12 @@ Item {
         root._stopping = false
         cavaRestartTimer.restart()
       } else {
-        // Unexpected death: clear availability so the existing probe/backoff
-        // re-arms instead of flatlining until the shell restarts.
+        // Unexpected death: clear availability and re-probe only after a fixed
+        // backoff. Probing immediately would re-start cava as fast as it dies
+        // (a tight spawn->die loop); the 10s cavaRetryTimer still covers the
+        // missing-binary case.
         root.cavaAvailable = false
-        cavaCheck.running = true
+        cavaBackoffTimer.restart()
       }
     }
   }
@@ -364,6 +367,16 @@ Item {
     onTriggered: root.syncCava()
   }
 
+  // One-shot backoff after an unexpected cava death (see onRunningChanged).
+  // The probe runs after ~3s, so repeated instant failures restart cava at
+  // most once per backoff instead of back-to-back.
+  Timer {
+    id: cavaBackoffTimer
+    interval: 3000
+    repeat: false
+    onTriggered: if (root.cfg.vizEnabled && !cavaProc.running) cavaCheck.running = true
+  }
+
   Timer {
     id: cavaRetryTimer
     interval: 10000
@@ -392,6 +405,7 @@ Item {
       root.stopCava()
     }
     if (root.cfg.vizEnabled && root.setupDone && !root.cavaChecked) cavaCheck.running = true
+    if (!root.cfg.vizEnabled) cavaBackoffTimer.stop()
     root.syncCava()
   }
 
