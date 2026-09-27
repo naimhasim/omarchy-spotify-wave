@@ -92,6 +92,17 @@ use the bypass toggle (or set `preamp` down) rather than changing the default.
 The shell never runs plugin code, so step 3 — the one-time engine install — is
 required. It is safe to re-run after editing anything under `config/`.
 
+`install` records a hash of each fragment it writes in
+`${XDG_STATE_HOME:-$HOME/.local/state}/spotify-wave/setup.json`. Re-running it
+only replaces a destination that is missing, still matches what the plugin
+installed (a normal upgrade), or is byte-identical to the shipped source. If a
+destination was edited by hand or was already there before the plugin (a file
+that is neither our current source nor the version we recorded), it is copied to
+`${XDG_STATE_HOME:-$HOME/.local/state}/spotify-wave/backups/` first and a warning
+names the backup before the new fragment is written. The backup lives outside the
+PipeWire/WirePlumber config trees and is named `*.bak`, so it is never loaded as
+live config. `install --force` skips that backup-and-warn step.
+
 ## Remove
 
 ```
@@ -100,13 +111,16 @@ omarchy plugin disable naimhasim.spotify-wave
 omarchy plugin remove naimhasim.spotify-wave
 ```
 
-`uninstall` removes the installed fragments and restores `filter-chain.service`
-to the enabled state it had before install; it is only disabled again when the
-install was what enabled it, so a unit shared with other filter-chains is left
-untouched. `--purge` also deletes the state directory (settings and the
-install's enablement record). Drop `--purge` to keep the saved settings across a
-reinstall. `cava` is a system package and is left installed; remove it with
-`omarchy pkg drop cava` if unwanted.
+`uninstall` removes a fragment only when it matches what the plugin installed
+(the hash recorded at install time, or the current shipped source for an older
+install with no record). A fragment that was edited by hand is left in place and
+a warning says why, so a local change is never deleted. It then restores
+`filter-chain.service` to the enabled state it had before install; it is only
+disabled again when the install was what enabled it, so a unit shared with other
+filter-chains is left untouched. `--purge` also deletes the state directory
+(settings, the install's enablement record and any backups). Drop `--purge` to
+keep the saved settings across a reinstall. `cava` is a system package and is
+left installed; remove it with `omarchy pkg drop cava` if unwanted.
 
 ## Layout
 

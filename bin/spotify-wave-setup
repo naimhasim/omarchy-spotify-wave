@@ -37,6 +37,18 @@ CC_DST="$CONFIG_HOME/pipewire/client.conf.d/60-spotify-wave.conf"
 WP_DST="$CONFIG_HOME/wireplumber/wireplumber.conf.d/60-spotify-wave.conf"
 STATE_DIR="$STATE_HOME/spotify-wave"
 SETUP_FILE="$STATE_DIR/setup.json"
+BACKUP_DIR="$STATE_DIR/backups"
+
+# The four config fragments this plugin owns, as trusted src->dst pairs. The
+# kind label disambiguates the two same-named 60-spotify-wave.conf files and
+# keys the recorded hash in setup.json's installedFragments map.
+FRAGMENTS=(
+  "filter-chain|$PW_SRC|$PW_DST"
+  "pipewire-pulse|$PP_SRC|$PP_DST"
+  "client|$CC_SRC|$CC_DST"
+  "wireplumber|$WP_SRC|$WP_DST"
+)
+FORCE=0
 
 usage() {
   cat <<'EOF'
@@ -48,10 +60,14 @@ Commands:
                      filter-chain.service, restart wireplumber.service, seed the
                      state file on first run and apply the saved state. Records
                      filter-chain.service's prior enabled state and only enables
-                     the unit when it is not already enabled.
+                     the unit when it is not already enabled. A fragment that is
+                     not the one we installed (user-edited or foreign) is backed
+                     up before being replaced.
+  install --force    As install, but overwrite such files without backing up.
   uninstall          Remove the installed config, restore filter-chain.service's
                      pre-install enabled state (only disable it when install
                      enabled it), restart the services and keep the state file.
+                     A fragment that differs from what we installed is kept.
   uninstall --purge  Same, but also delete the state directory.
   -h, --help         Show this help.
 EOF
@@ -96,21 +112,113 @@ setup_owned() { # true only when this plugin enabled filter-chain.service
     "$SETUP_FILE" 2>/dev/null || printf 'false\n'
 }
 
-_write_setup() { # <before> <owned>; caller holds the lock
+_existing_fragments() { # recorded installedFragments map; {} when absent/legacy
+  [ -f "$SETUP_FILE" ] || { printf '{}\n'; return 0; }
+  jq -c '.installedFragments // {}' "$SETUP_FILE" 2>/dev/null || printf '{}\n'
+}
+
+_write_setup() { # <before> <owned> <fragments_json>; caller holds the lock
   local tmp
   tmp=$(mktemp "$STATE_DIR/setup.json.XXXXXX")
-  jq -n --arg before "$1" --argjson owned "$2" \
-    '{filterChainEnabledBefore: $before, filterChainEnabledByPlugin: $owned}' \
+  jq -n --arg before "$1" --argjson owned "$2" --argjson frags "$3" \
+    '{filterChainEnabledBefore: $before, filterChainEnabledByPlugin: $owned,
+      installedFragments: $frags}' \
     > "$tmp"
   mv "$tmp" "$SETUP_FILE"
 }
 
-record_setup() { # <before> <owned>
+record_setup() { # <before> <owned>; preserves an existing installedFragments map
   mkdir -p "$STATE_DIR"
-  with_state_lock _write_setup "$1" "$2"
+  with_state_lock _write_setup "$1" "$2" "$(_existing_fragments)"
+}
+
+record_fragments() { # <fragments_json>; preserves the ownership fields
+  mkdir -p "$STATE_DIR"
+  with_state_lock _write_setup "$(setup_before)" "$(setup_owned)" "$1"
+}
+
+fragment_record() { # <key>: recorded installed hash, empty when no record
+  [ -f "$SETUP_FILE" ] || return 0
+  jq -r --arg k "$1" '.installedFragments[$k] // empty' "$SETUP_FILE" 2>/dev/null || true
+}
+
+sha256_of() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# Backups live outside the PipeWire/WirePlumber trees and never end in .conf so
+# they can never be picked up as live config.
+backup_path() { # <dst> <kind>
+  local base kind ts p n
+  base=$(basename "$1")
+  kind=$2
+  mkdir -p "$BACKUP_DIR"
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  p="$BACKUP_DIR/$base.$kind.$ts.bak"
+  n=1
+  while [ -e "$p" ]; do
+    p="$BACKUP_DIR/$base.$kind.$ts.$n.bak"
+    n=$((n + 1))
+  done
+  printf '%s\n' "$p"
+}
+
+# install_fragment <kind> <src> <dst>: copy when needed, never clobber a
+# user-edited/foreign file without backing it up first. Prints the new recorded
+# hash; warnings go to stderr.
+install_fragment() {
+  local kind=$1 src=$2 dst=$3 key src_hash dst_hash rec backup
+  key="$(basename "$dst"):$kind"
+  src_hash=$(sha256_of "$src")
+  mkdir -p "$(dirname "$dst")"
+
+  if [ ! -e "$dst" ]; then                 # fresh install
+    install -m 0644 "$src" "$dst"
+    printf '%s\n' "$src_hash"
+    return 0
+  fi
+
+  dst_hash=$(sha256_of "$dst")
+  if [ "$dst_hash" = "$src_hash" ]; then   # already current: idempotent no-op
+    printf '%s\n' "$src_hash"
+    return 0
+  fi
+
+  rec=$(fragment_record "$key")
+  if [ "$FORCE" -eq 0 ] && ! { [ -n "$rec" ] && [ "$dst_hash" = "$rec" ]; }; then
+    backup=$(backup_path "$dst" "$kind")
+    cp -p "$dst" "$backup"
+    printf 'spotify-wave-setup: warning: %s differs from the installed version; backed up to %s\n' \
+      "$dst" "$backup" >&2
+  fi
+
+  install -m 0644 "$src" "$dst"           # upgrade, or forced overwrite
+  printf '%s\n' "$src_hash"
+}
+
+# remove_fragment <kind> <src> <dst>: delete only when the file is what we
+# installed (recorded hash) or still matches the shipped source; a user-edited
+# or foreign file is left in place with a warning.
+remove_fragment() {
+  local kind=$1 src=$2 dst=$3 key rec dst_hash
+  [ -e "$dst" ] || return 0
+  key="$(basename "$dst"):$kind"
+  rec=$(fragment_record "$key")
+  dst_hash=$(sha256_of "$dst")
+  if { [ -n "$rec" ] && [ "$dst_hash" = "$rec" ]; } || cmp -s "$src" "$dst"; then
+    rm -f "$dst"
+  else
+    printf 'spotify-wave-setup: warning: kept %s: it differs from what the plugin installed\n' \
+      "$dst" >&2
+  fi
 }
 
 cmd_install() {
+  FORCE=0
+  case "${1:-}" in
+    --force) FORCE=1 ;;
+    '') ;;
+    *) die "install: unknown option '${1}'" ;;
+  esac
+
   [ -f "$PW_SRC" ] || die "missing source config: $PW_SRC"
   [ -f "$PP_SRC" ] || die "missing source config: $PP_SRC"
   [ -f "$CC_SRC" ] || die "missing source config: $CC_SRC"
@@ -142,12 +250,18 @@ cmd_install() {
   fi
   record_setup "$before" "$owned"
 
-  mkdir -p "$(dirname "$PW_DST")" "$(dirname "$PP_DST")" \
-    "$(dirname "$CC_DST")" "$(dirname "$WP_DST")"
-  install -m 0644 "$PW_SRC" "$PW_DST"
-  install -m 0644 "$PP_SRC" "$PP_DST"
-  install -m 0644 "$CC_SRC" "$CC_DST"
-  install -m 0644 "$WP_SRC" "$WP_DST"
+  # Install the fragments, tracking them so a later install/uninstall can tell
+  # "ours" from a user-edited or foreign file at the same path. Fragments that
+  # are not ours are backed up (never lost) before being replaced.
+  local frags_json entry kind src dst hash
+  frags_json=$(_existing_fragments)
+  for entry in "${FRAGMENTS[@]}"; do
+    IFS='|' read -r kind src dst <<<"$entry"
+    hash=$(install_fragment "$kind" "$src" "$dst")
+    frags_json=$(jq -c --arg k "$(basename "$dst"):$kind" --arg h "$hash" \
+      '. + {($k): $h}' <<<"$frags_json")
+  done
+  record_fragments "$frags_json"
 
   # filter-chain.service owns the spotify_wave sink; wireplumber applies the
   # stream rules. client.conf.d is read by each native client at startup, so no
@@ -200,7 +314,11 @@ cmd_uninstall() {
   local owned
   owned=$(setup_owned)
 
-  rm -f "$PW_DST" "$PP_DST" "$CC_DST" "$WP_DST"
+  local entry kind src dst
+  for entry in "${FRAGMENTS[@]}"; do
+    IFS='|' read -r kind src dst <<<"$entry"
+    remove_fragment "$kind" "$src" "$dst"
+  done
 
   if [ "$owned" = true ]; then
     systemctl --user disable filter-chain.service >/dev/null 2>&1 || true
