@@ -97,11 +97,12 @@ required. It is safe to re-run after editing anything under `config/`.
 only replaces a destination that is missing, still matches what the plugin
 installed (a normal upgrade), or is byte-identical to the shipped source. If a
 destination was edited by hand or was already there before the plugin (a file
-that is neither our current source nor the version we recorded), it is copied to
-`${XDG_STATE_HOME:-$HOME/.local/state}/spotify-wave/backups/` first and a warning
-names the backup before the new fragment is written. The backup lives outside the
-PipeWire/WirePlumber config trees and is named `*.bak`, so it is never loaded as
-live config. `install --force` skips that backup-and-warn step.
+that is neither our current source nor the version we recorded), it is left
+untouched and a warning names it; the run exits non-zero. Re-run with
+`install --force` to back the file up to
+`${XDG_STATE_HOME:-$HOME/.local/state}/spotify-wave/backups/` and replace it;
+that run exits 0 on success. The backup lives outside the PipeWire/WirePlumber
+config trees and is named `*.bak`, so it is never loaded as live config.
 
 ## Remove
 

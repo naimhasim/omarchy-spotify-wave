@@ -14,6 +14,11 @@
 # found and only enables the unit when it is not already enabled; uninstall
 # only disables it again when this plugin was the one that enabled it.
 #
+# install never clobbers a destination that is neither our recorded install nor
+# the current shipped source: it warns and skips such a conflict unless --force
+# is given, in which case the file is backed up first. install exits non-zero
+# when any fragment was skipped so callers can detect a conflict.
+#
 # Idempotent: safe to run install or uninstall repeatedly. Never restarts
 # pipewire.service; pipewire-pulse.service is only restarted when its fragment
 # actually changes (pulse.rules are read once at module load).
@@ -61,9 +66,11 @@ Commands:
                      state file on first run and apply the saved state. Records
                      filter-chain.service's prior enabled state and only enables
                      the unit when it is not already enabled. A fragment that is
-                     not the one we installed (user-edited or foreign) is backed
-                     up before being replaced.
-  install --force    As install, but overwrite such files without backing up.
+                     not the one we installed (user-edited or foreign) is left
+                     untouched and reported; exit status is non-zero when any
+                     fragment was skipped.
+  install --force    As install, but back up and replace such conflicting files.
+                     Exits 0 on success.
   uninstall          Remove the installed config, restore filter-chain.service's
                      pre-install enabled state (only disable it when install
                      enabled it), restart the services and keep the state file.
@@ -161,9 +168,12 @@ backup_path() { # <dst> <kind>
   printf '%s\n' "$p"
 }
 
-# install_fragment <kind> <src> <dst>: copy when needed, never clobber a
-# user-edited/foreign file without backing it up first. Prints the new recorded
-# hash; warnings go to stderr.
+# install_fragment <kind> <src> <dst>: copy when needed. Returns 0 with the new
+# recorded hash on stdout for a fresh install, a no-op (dst == src) or a normal
+# upgrade of our own file (dst == recorded hash). Returns 3 without touching the
+# destination when it is a conflict (user-edited/foreign) and --force was not
+# given. With --force it backs the conflict up first, then overwrites. Warnings
+# go to stderr.
 install_fragment() {
   local kind=$1 src=$2 dst=$3 key src_hash dst_hash rec backup
   key="$(basename "$dst"):$kind"
@@ -183,15 +193,28 @@ install_fragment() {
   fi
 
   rec=$(fragment_record "$key")
-  if [ "$FORCE" -eq 0 ] && ! { [ -n "$rec" ] && [ "$dst_hash" = "$rec" ]; }; then
-    backup=$(backup_path "$dst" "$kind")
-    cp -p "$dst" "$backup"
-    printf 'spotify-wave-setup: warning: %s differs from the installed version; backed up to %s\n' \
-      "$dst" "$backup" >&2
+  if [ -n "$rec" ] && [ "$dst_hash" = "$rec" ]; then
+    install -m 0644 "$src" "$dst"          # normal upgrade of our own file
+    printf '%s\n' "$src_hash"
+    return 0
   fi
 
-  install -m 0644 "$src" "$dst"           # upgrade, or forced overwrite
+  # Conflict: user-edited or foreign file at a path we own. Never clobber it
+  # without an explicit overwrite choice.
+  if [ "$FORCE" -eq 0 ]; then
+    printf 'spotify-wave-setup: warning: %s differs from the installed version; left untouched\n' \
+      "$dst" >&2
+    printf 'spotify-wave-setup:   re-run with --force to back it up and replace it\n' >&2
+    return 3
+  fi
+
+  backup=$(backup_path "$dst" "$kind")
+  cp -p "$dst" "$backup"
+  printf 'spotify-wave-setup: warning: %s differs from the installed version; backed up to %s\n' \
+    "$dst" "$backup" >&2
+  install -m 0644 "$src" "$dst"            # forced overwrite
   printf '%s\n' "$src_hash"
+  return 0
 }
 
 # remove_fragment <kind> <src> <dst>: delete only when the file is what we
@@ -251,15 +274,19 @@ cmd_install() {
   record_setup "$before" "$owned"
 
   # Install the fragments, tracking them so a later install/uninstall can tell
-  # "ours" from a user-edited or foreign file at the same path. Fragments that
-  # are not ours are backed up (never lost) before being replaced.
-  local frags_json entry kind src dst hash
+  # "ours" from a user-edited or foreign file at the same path. A conflicting
+  # fragment is skipped (and its record kept) unless --force was given; the
+  # summary below makes the non-zero exit actionable.
+  local frags_json entry kind src dst hash skipped=0
   frags_json=$(_existing_fragments)
   for entry in "${FRAGMENTS[@]}"; do
     IFS='|' read -r kind src dst <<<"$entry"
-    hash=$(install_fragment "$kind" "$src" "$dst")
-    frags_json=$(jq -c --arg k "$(basename "$dst"):$kind" --arg h "$hash" \
-      '. + {($k): $h}' <<<"$frags_json")
+    if hash=$(install_fragment "$kind" "$src" "$dst"); then
+      frags_json=$(jq -c --arg k "$(basename "$dst"):$kind" --arg h "$hash" \
+        '. + {($k): $h}' <<<"$frags_json")
+    else
+      skipped=$((skipped + 1))
+    fi
   done
   record_fragments "$frags_json"
 
@@ -293,6 +320,12 @@ cmd_install() {
     printf '; pipewire-pulse restarted'
   fi
   printf '\n'
+
+  if [ "$skipped" -gt 0 ]; then
+    printf 'spotify-wave-setup: skipped %s conflicting fragment(s); re-run with --force to overwrite\n' \
+      "$skipped" >&2
+    exit 1
+  fi
 }
 
 cmd_uninstall() {
